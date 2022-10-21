@@ -1,5 +1,5 @@
 ---
-title: "Mass spec wrangling"
+title: "LC/MS for Humanized Sterol Biosynthesis (HsS) Strains"
 author: "Michelle Vandeloo"
 date: '2022-10-21'
 output: html_document
@@ -72,6 +72,10 @@ mapp_yeast <- getBM(attributes=c('ensembl_gene_id', 'external_gene_name', 'sgd_g
 ```
 
 Import the spectrum reads data for all replicates of all samples. One sample (RSHIP4NT, HsS8.1) was run an additional time due to significantly low coverage on one run, likely due to a sample preparation error. We also filter the data for yeast genes and human genes in the sterol biosynthesis pathway, remove decoy calls and the 4th run of HsS8.1. We make two version: one with the yeast common names, and one with the systematic names - the common names are easier to visualize in figures, but the systematic names are required for certain analysis steps like KEGG pathway enrichment analysis.
+
+WT refers to the wild-type strain
+RSHIP4N refers to HsS7.1
+RSHIP4NT refers to HsS8.1
 
 ```{r replicate data}
 yeast_ms_raw <- read.csv(paste(raw_path, "/sc_all_raw.csv", sep = ""), header = TRUE, fileEncoding = 'UTF-8-BOM') %>%
