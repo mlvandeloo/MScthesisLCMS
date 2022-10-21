@@ -1,0 +1,486 @@
+---
+title: "Mass spec wrangling"
+author: "Michelle Vandeloo"
+date: '2022-10-21'
+output: html_document
+---
+
+This document describes the analysis pipeline for the mass spectrometry data in my Masters thesis. The required packages are: tidyverse, biomaRt, edgeR, ggrepel, gridExtra, ComplexHeatmap, circlize, and ClusterProfiler.
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+# install.packages("tidyverse")
+library(tidyverse)
+
+#BiocManager::install("biomaRt")
+library(biomaRt)
+
+# BiocManager::install("edgeR")
+library(edgeR)
+
+# install.packages("ggrepel")
+library(ggrepel)
+
+#install.packages("gridExtra")
+library(gridExtra)
+
+#BiocManager::install("ComplexHeatmap")
+library(ComplexHeatmap)
+
+library(circlize)
+
+# BiocManager::install("clusterProfiler")
+library(clusterProfiler)
+```
+
+Set the source for raw data (raw data used for this study was unique spectrum counts for peptides mapped to proteins for yeast and human proteome data using Scaffold Viewer).
+
+```{r set up working directories}
+raw_path <- "C:/Users/mvand/OneDrive/Documents/School & Work/Kachroo Lab/Mass spec/raw"
+data_path <- "C:/Users/mvand/OneDrive/Documents/School & Work/Kachroo Lab/Mass spec/data"
+
+```
+
+To generate the figure confirming presence/absence of genes, raw spectrum counts were exported to excel, averaged across replicates, and any value > 0 was given a "1" and the rest were given "0". This script takes that raw file and creates a "heatmap" with coloured boxes indicating presence or absence of each protein in each strain.
+
+```{r presence or absence heatmap}
+binary <- read.csv(paste(raw_path, "/binary_detection.csv", sep = ""), header = TRUE, fileEncoding = 'UTF-8-BOM') 
+
+row.names(binary) <- binary$Gene
+
+binary[is.na(binary)] <- 0
+
+binary_f <- binary %>%
+  .[, 2:4] %>%
+  as.matrix()
+
+col_fun = colorRamp2(c(-1, 0, 1), c("blue", "white", "#218F8C"))
+
+Heatmap(binary_f, show_heatmap_legend = FALSE, cluster_columns = FALSE, show_column_names = FALSE, cluster_rows = FALSE, col = col_fun, rect_gp = gpar(col = "black", lwd = 2), column_split = factor(rep(c("WT","HsS7.1", "HsS8.1"), 1)))
+
+```
+
+We import a couple database files to annotate the gene lists we will generate later - one that just maps yeast common gene names to the systematic gene names, and another with more annotations (SGD code, Entrez gene ID, description).
+
+```{r annotations}
+mapping <- getBM(attributes=c('external_gene_name', 'ensembl_gene_id'), mart = useMart("ensembl", dataset = "scerevisiae_gene_ensembl")) 
+
+mapp_yeast <- getBM(attributes=c('ensembl_gene_id', 'external_gene_name', 'sgd_gene', 'entrezgene_id', 'description'), mart = useMart("ensembl", dataset = "scerevisiae_gene_ensembl"))
+
+```
+
+Import the spectrum reads data for all replicates of all samples. One sample (RSHIP4NT, HsS8.1) was run an additional time due to significantly low coverage on one run, likely due to a sample preparation error. We also filter the data for yeast genes and human genes in the sterol biosynthesis pathway, remove decoy calls and the 4th run of HsS8.1. We make two version: one with the yeast common names, and one with the systematic names - the common names are easier to visualize in figures, but the systematic names are required for certain analysis steps like KEGG pathway enrichment analysis.
+
+```{r replicate data}
+yeast_ms_raw <- read.csv(paste(raw_path, "/sc_all_raw.csv", sep = ""), header = TRUE, fileEncoding = 'UTF-8-BOM') %>%
+  rowwise() %>%
+  mutate(almost = sub(".*GN=", "", Protein.name)) %>%
+  mutate(gene = sub(" PE=.*", "", almost))
+
+erg_gene <- c("HMG1", "ERG8", "IDI1", "ERG1", "ERG24", "ERG25", "ERG26")
+other_erg <- c("ERG10", "ERG13", "ERG12", "MVD1", "ERG20", "ERG9", "ERG7", "ERG11", "ERG27")
+all_hsg <- c("HMGCR", "PMVK", "IDI1", "FDFT1", "SQLE", "LBR", "MSMO1", "NSDHL")
+
+yeast_ms <- yeast_ms_raw %>%
+  dplyr::select(Biological.sample.category, Biological.sample.name, gene, Protein.accession.numbers,  Exclusive.unique.spectrum.count) %>%
+  dplyr::filter(!grepl("DECOY", Protein.accession.numbers), Biological.sample.name != "RSHIP4NT_d") %>%
+  filter(!(gene %in% erg_gene))
+
+yeast_ms_names = c("sample", "replicate", "sc_gene", "uniprot_id", "spec_count") 
+
+names(yeast_ms) <- yeast_ms_names
+
+yeast_ms_mapped <- left_join(yeast_ms, mapping, by = c("sc_gene" = "external_gene_name")) %>%
+  ungroup %>%
+  mutate(gene = coalesce(ensembl_gene_id, sc_gene)) %>%
+  dplyr::select(gene, replicate, spec_count)
+```
+
+We then format this data such that it can be organised into a matrix of spectrum counts for every protein, for every replicate of the three samples, and filter this for only our sterol biosynthesis genes of interest.
+
+```{r only yeast genes}
+yeast_ms_all_erg <- yeast_ms_raw %>%
+  dplyr::select(Biological.sample.category, Biological.sample.name, gene, Protein.accession.numbers,  Exclusive.unique.spectrum.count) %>%
+  dplyr::filter(!grepl("DECOY", Protein.accession.numbers), 
+                Biological.sample.name != "RSHIP4NT_d",
+                gene %in% c(erg_gene, other_erg))
+
+names(yeast_ms_all_erg) <- yeast_ms_names
+
+sc_ms_distribution <- yeast_ms_all_erg %>%
+  dplyr::select(replicate, sc_gene, spec_count) %>%
+  pivot_wider(names_from = replicate, values_from = spec_count) %>%
+  dplyr::select(sc_gene, WT_a, RSHIP4N_a, RSHIP4NT_a, WT_b, RSHIP4N_b, RSHIP4NT_b, WT_c, RSHIP4N_c, RSHIP4NT_c) %>%
+  mutate_all(~replace(., is.na(.), 0)) %>%
+  arrange(factor(sc_gene, levels = c('ERG10', 'ERG13', 'ERG12', 'MVD1', 'ERG20', 'ERG11', 'ERG27', 'HMG1', 'ERG8', 'IDI1', 'ERG1', 'ERG24', 'ERG25', 'ERG26', 'ERG9' ))) 
+
+row.names(sc_ms_distribution) <- sc_ms_distribution$sc_gene
+
+sc_ms_dist_fin <- sc_ms_distribution %>%
+  .[, 2:10] %>%
+  as.matrix()
+
+row.names(sc_ms_dist_fin) <- sc_ms_distribution$sc_gene
+```
+
+This function and code will calculate the z-scores across samples for every protein, and then express that data as a heatmap for the sterol biosynthesis genes. Each column represents a single replicate of the sample. Blank (pale blue) stripes for an entire section mean the gene was not detected (this is what we expect to see, as the genes with blank stripes have been replaced with human genes, and thus the human protein should be expressed instead in HsS7.1 and HsS8.1).
+
+```{r z score formula and yeast heatmap}
+cal_z_score <- function(x){
+   (x-mean(x)) / sd(x)
+}
+
+genelist_norm_sc <- t(apply(sc_ms_dist_fin, 1, cal_z_score)) %>%
+  na.omit() %>% 
+  data.frame(sc_gene = row.names(.), .) %>%
+  .[, 2:10] %>%
+  as.matrix()
+
+Heatmap(genelist_norm_sc, name = "z-score", show_row_names = TRUE, show_column_names = FALSE, cluster_rows = FALSE, cluster_columns = FALSE, column_split = factor(rep(c("WT", "HsS7.1", "HsS8.1"), 3)))
+```
+
+We repeat the above process to get a matrix of the spectrum counts for the human genes that have been replaced in these strains: FDFT1, IDI1, SQLE, LBR, SC4MOL, NSDHL - PMVK and HMGCR were not detected, and do not show up in these results.
+
+```{r human genes}
+human_ms <- read.csv(paste(raw_path, "/hs_all_raw.csv", sep = ""), header = TRUE, fileEncoding = 'UTF-8-BOM') %>%
+  rowwise() %>%
+  mutate(almost = sub(".*GN=", "", Protein.name)) %>%
+  mutate(gene = sub(" PE=.*", "", almost)) %>%
+  dplyr::select(Biological.sample.category, Biological.sample.name, gene, Protein.accession.numbers,  Exclusive.unique.spectrum.count) %>%
+  dplyr::filter(!grepl("DECOY", Protein.accession.numbers), 
+                Biological.sample.name != "RSHIP4NT_d", 
+                gene %in% all_hsg) %>%
+  mutate(gene = str_replace_all(gene, c("MSMO1" = "SC4MOL")))
+
+human_ms_names = c("sample", "replicate", "hs_gene", "uniprot_id", "spec_count") 
+
+names(human_ms) <- human_ms_names
+
+hs_ms_distribution <- human_ms %>%
+  dplyr::select(replicate, hs_gene, spec_count) %>%
+  pivot_wider(names_from = replicate, values_from = spec_count) %>%
+  dplyr::select(hs_gene, RSHIP4N_a, RSHIP4NT_a, RSHIP4N_b, RSHIP4NT_b, RSHIP4N_c, RSHIP4NT_c) %>%
+  mutate_all(~replace(., is.na(.), 0)) %>%
+  arrange(factor(hs_gene, levels = c("FDFT1", "IDI1", "SQLE", "LBR", "SC4MOL", "NSDHL"))) 
+
+row.names(hs_ms_distribution) <- hs_ms_distribution$hs_gene
+
+hs_ms_dist_fin <- hs_ms_distribution %>%
+  .[, 2:7] %>%
+  as.matrix()
+
+row.names(hs_ms_dist_fin) <- hs_ms_distribution$hs_gene
+```
+
+We calculate z-scores for the human protein expression as with the yeast genes earlier, and express this as a heatmap (WT is not included as none of these proteins are expressed in the WT - only in humanized strains).
+
+```{r human genes heatmap}
+genelist_norm_hs <- t(apply(hs_ms_dist_fin, 1, cal_z_score)) %>%
+  na.omit() %>% 
+  data.frame(hs_gene = row.names(.), .) %>%
+  .[, 2:7] %>%
+  as.matrix()
+
+Heatmap(genelist_norm_hs, name = "z-score", show_row_names = TRUE, show_column_names = FALSE, cluster_rows = FALSE, cluster_columns = FALSE, column_split = factor(rep(c("HsS7.1", "HsS8.1"), 3)))
+```
+
+Now, to do differential expression (DE) analysis, we will use the package edgeR. We need to run this twice: once with systematic names, once with common names, but the code is the same. We reorganise the data to fit into the DGE system and fit it to a matrix. Then we generate a DGE (differential gene expression, used here as a proxy for protein expression) list with the three sample times, with WT as the reference type. The edgeR package can normalize the data counts across the proteome, estimate the dispersion between samples (we can see that the WT data are fairly dispersed, which will have a negative impact on our data quality), and calculate counts per million.
+
+```{r prep of DGE data w systematic names}
+sc_to_dge_sys <- yeast_ms_mapped %>%
+  dplyr::select(replicate, gene, spec_count) %>%
+  pivot_wider(names_from = replicate, values_from = spec_count) %>%
+  dplyr::select(gene, WT_a, WT_b, WT_c, RSHIP4N_a, RSHIP4N_b, RSHIP4N_c, RSHIP4NT_a, RSHIP4NT_b, RSHIP4NT_c) %>%
+  mutate_all(~replace(., is.na(.), 0))
+
+row.names(sc_to_dge_sys) <- sc_to_dge_sys$gene
+
+sc_to_dge_fin_sys <- sc_to_dge_sys %>%
+  .[, 2:10] %>%
+  as.matrix()
+
+row.names(sc_to_dge_fin_sys) <- sc_to_dge_sys$gene
+
+sample_info_1st <- c("WT", "WT", "WT", "RSHIP4N", "RSHIP4N", "RSHIP4N", "RSHIP4NT", "RSHIP4NT", "RSHIP4NT")
+dge_sys <- DGEList(counts = sc_to_dge_fin_sys, group = factor(sample_info_1st))
+
+dge_sys$samples$group <- relevel(dge_sys$samples$group, ref="WT")
+
+dge_sys <- calcNormFactors(object = dge_sys)
+
+plotMDS(dge_sys)
+
+dge_sys <- estimateDisp(y = dge_sys)
+
+logcpm_sys <- cpm(dge_sys, log=TRUE)
+```
+
+We repeat this with the common gene names, for figures.
+
+```{r prep of DGE data w symbols}
+sc_to_dge <- yeast_ms %>%
+  dplyr::select(replicate, sc_gene, spec_count) %>%
+  pivot_wider(names_from = replicate, values_from = spec_count) %>%
+  dplyr::select(sc_gene, WT_a, WT_b, WT_c, RSHIP4N_a, RSHIP4N_b, RSHIP4N_c, RSHIP4NT_a, RSHIP4NT_b, RSHIP4NT_c) %>%
+  mutate_all(~replace(., is.na(.), 0))
+
+row.names(sc_to_dge) <- sc_to_dge$sc_gene
+
+sc_to_dge_fin <- sc_to_dge %>%
+  .[, 2:10] %>%
+  as.matrix()
+
+row.names(sc_to_dge_fin) <- sc_to_dge$sc_gene
+
+sample_info_1st <- c("WT", "WT", "WT", "RSHIP4N", "RSHIP4N", "RSHIP4N", "RSHIP4NT", "RSHIP4NT", "RSHIP4NT")
+dge <- DGEList(counts = sc_to_dge_fin, group = factor(sample_info_1st))
+
+dge$samples$group <- relevel(dge$samples$group, ref="WT")
+
+dge <- calcNormFactors(object = dge)
+
+dge <- estimateDisp(y = dge)
+
+logcpm <- cpm(dge, log=TRUE)
+```
+
+As we are comparing three strains (WT, HsS7.1 and HsS8.1), we run the analysis 3 times, once for each pair. Starting with comparing the protein expression in HsS7.1 with the WT, we select those two strains (conditions 1 and 2), and edgeR will calculate the log fold-change between each protein, as well as the log of counts per million, the p-value, and the false discovery rate. We can later print a list of all the top DE proteins. Finally, for figures, we select all the significantly up- and down-regulated proteins, tag, them, and create the volcano plot.
+
+```{r 7-gene vs wt data}
+et_7g <- exactTest(object = dge, pair = c(1,2))
+et_7g_sys <- exactTest(object = dge_sys, pair = c(1,2))
+
+top_degs_7g = topTags(object = et_7g_sys, n = "Inf") %>%
+  data.frame(ensembl_gene_id = row.names(.), .)
+
+tags_7g <- left_join(top_degs_7g, mapp_yeast, by = "ensembl_gene_id")
+
+fc_7g <- data.frame(gene = row.names(et_7g$table), et_7g$table) %>%
+  rowwise() %>%
+  mutate(logpval = -log10(PValue),
+         Change = case_when(logFC >= 1 & PValue <= 0.05 ~ "up",
+                               logFC <= -1 & PValue <= 0.05 ~ "down",
+                               TRUE ~ "ns"))
+
+top_genes_7g <- bind_rows(fc_7g %>%
+                         dplyr::filter(Change == 'up') %>%
+                         arrange(PValue, desc(abs(logFC))) %>%
+                         head(10),
+                       fc_7g %>%
+                         dplyr::filter(Change == 'down') %>%
+                         arrange(PValue, desc(abs(logFC))) %>%
+                         head(10)
+)
+
+plot7g <- ggplot(fc_7g, aes(x= logFC, y=logpval, colour = Change)) +
+  geom_point() +
+  scale_color_manual(values = c("down" = "#4472C4", "ns" = "black", "up" = "#C83232")) +
+  geom_hline(yintercept = -log10(0.05),
+             linetype = "dashed") + 
+  geom_vline(xintercept = c(-1, 1),
+             linetype = "dashed") +
+  scale_x_continuous(breaks = c(seq(-8, 8, 2)),       
+                     limits = c(-7, 7)) +
+  scale_y_continuous(breaks = c(seq(0, 15, 3)),
+                     limits = c(0, 14)) +
+  xlab("log(fold change)") + 
+  ylab("-log10(p-value)") +
+  theme_bw() +
+  geom_label_repel(data = top_genes_7g, mapping = aes(logFC, logpval, label = gene),
+                   size = 3) +
+  theme(legend.position = "none") +
+  ggtitle("7-gene strain vs WT")
+```
+
+We do the same for comparing HsS8.1 with the WT.
+
+```{r 8-gene vs wt pathways}
+et_8g <- exactTest(object = dge, pair = c(1,3))
+et_8g_sys <- exactTest(object = dge_sys, pair = c(1,3))
+
+top_degs_8g = topTags(object = et_8g_sys, n = "Inf") %>%
+  data.frame(ensembl_gene_id = row.names(.), .)
+
+tags_8g <- left_join(top_degs_8g, mapp_yeast, by = "ensembl_gene_id")
+
+fc_8g <- data.frame(gene = row.names(et_8g$table), et_8g$table) %>%
+  rowwise() %>%
+  mutate(logpval = -log10(PValue),
+         Change = case_when(logFC >= 1 & PValue <= 0.05 ~ "up",
+                               logFC <= -1 & PValue <= 0.05 ~ "down",
+                               TRUE ~ "ns"))
+
+top_genes_8g <- bind_rows(fc_8g %>%
+                         dplyr::filter(Change == 'up') %>%
+                         arrange(PValue, desc(abs(logFC))) %>%
+                         head(10),
+                       fc_8g %>%
+                         dplyr::filter(Change == 'down') %>%
+                         arrange(PValue, desc(abs(logFC))) %>%
+                         head(10)
+)
+
+plot8g <- ggplot(fc_8g, aes(x= logFC, y=logpval, colour = Change)) +
+  geom_point() +
+  scale_color_manual(values = c("down" = "#4472C4", "ns" = "black", "up" = "#C83232")) +
+  geom_hline(yintercept = -log10(0.05),
+             linetype = "dashed") + 
+  geom_vline(xintercept = c(-1, 1),
+             linetype = "dashed") +
+  scale_x_continuous(breaks = c(seq(-8, 8, 2)),       
+                     limits = c(-7, 7)) +
+  scale_y_continuous(breaks = c(seq(0, 15, 3)),
+                     limits = c(0, 14)) +
+  xlab("log(fold change)") + 
+  ylab("-log10(p-value)") +
+  theme_bw() +
+  geom_label_repel(data = top_genes_8g, mapping = aes(logFC, logpval, label = gene),
+                   size = 3) +
+  theme(legend.position = "none") +
+  ggtitle("8-gene strain vs WT")
+```
+
+And we do the same again for comparing HsS8.1 to HsS7.1.
+
+```{r 8-gene vs 7-gene}
+et_7v8 <- exactTest(object = dge, pair = c(2,3))
+et_7v8_sys <- exactTest(object = dge_sys, pair = c(2,3))
+
+top_degs_7v8 = topTags(object = et_7v8_sys, n = "Inf") %>%
+  data.frame(ensembl_gene_id = row.names(.), .)
+
+tags_7v8 <- left_join(top_degs_7v8, mapp_yeast, by = "ensembl_gene_id")
+
+fc_7v8 <- data.frame(gene = row.names(et_7v8$table), et_7v8$table) %>%
+  rowwise() %>%
+  mutate(logpval = -log10(PValue),
+         Change = case_when(logFC >= 1 & PValue <= 0.05 ~ "up",
+                               logFC <= -1 & PValue <= 0.05 ~ "down",
+                               TRUE ~ "ns"))
+
+top_genes_7v8 <- bind_rows(fc_7v8 %>%
+                         dplyr::filter(Change == 'up') %>%
+                         arrange(PValue, desc(abs(logFC))) %>%
+                         head(10),
+                       fc_7v8 %>%
+                         dplyr::filter(Change == 'down') %>%
+                         arrange(PValue, desc(abs(logFC))) %>%
+                         head(10)
+)
+
+plot7v8 <- ggplot(fc_7v8, aes(x= logFC, y=logpval, colour = Change)) +
+  geom_point() +
+  scale_color_manual(values = c("down" = "#4472C4", "ns" = "black", "up" = "#C83232")) +
+  geom_hline(yintercept = -log10(0.05),
+             linetype = "dashed") + 
+  geom_vline(xintercept = c(-1, 1),
+             linetype = "dashed") +
+  scale_x_continuous(breaks = c(seq(-8, 8, 2)),       
+                     limits = c(-7, 7)) +
+  scale_y_continuous(breaks = c(seq(0, 15, 3)),
+                     limits = c(0, 14)) +
+  xlab("log(fold change)") + 
+  ylab("-log10(p-value)") +
+  theme_bw() +
+  geom_label_repel(data = top_genes_7v8, mapping = aes(logFC, logpval, label = gene),
+                   size = 3) +
+  theme(legend.position = "none") +
+  ggtitle("8-gene strain vs 7-gene strain")
+```
+
+And then we group all of these volcano plots together, with a common scale, to look at simulateneously.
+
+```{r all volcano plots}
+grid.arrange(plot7g, plot8g, plot7v8, ncol = 3)
+```
+
+To look at KEGG pathway enrichment among the DE proteins, we use the ClusterProfiler package. We pull KEGG enrichment data for all three comparisons first. The output gives us the KEGG pathway ID, the name of the pathway, the Gene Ratio (of all the top DE proteins with KEGG annotations for this comparison, how many are found in each pathway?), and the p-value of the call.
+
+```{r KEGG profiler}
+kegg_7gene <- enrichKEGG(gene = rownames(filter(top_degs_7g, PValue < 0.05, abs(logFC) > 1)),
+                 organism = "sce")%>%
+  as.data.frame() 
+
+kegg_8gene <- enrichKEGG(gene = rownames(filter(top_degs_8g, PValue < 0.05, abs(logFC) > 1)),
+                 organism = "sce") %>%
+  as.data.frame() 
+
+kegg_7v8 <- enrichKEGG(gene = rownames(filter(top_degs_7v8, PValue < 0.05, abs(logFC) > 1)),
+                 organism = "sce") %>%
+  as.data.frame() 
+```
+
+To visualise this, we use a grouped barplot, to map the GeneRatios as described above. Each individual KEGG enrichment dataframe is annotated with the strain comparison it corresponds to, and that data is all sorted together and rearranged to fit a bar plot.
+
+```{r kegg visualisations}
+k7 <- kegg_7gene %>%
+  mutate(comparison = "HsS7.1 vs WT")
+k8 <- kegg_8gene %>%
+  mutate(comparison = "HsS8.1 vs WT")
+k7v8 <- kegg_7v8 %>%
+  mutate(comparison = "HsS8.1 vs HsS7.1")
+keggs <- bind_rows(k7, k8, k7v8) %>%
+  select(comparison, Description, GeneRatio) %>%
+  as.tibble %>%
+  mutate(numerator = sub("/.*", "", GeneRatio)) %>%
+  mutate(denominator = sub(".*/", "", GeneRatio)) %>% 
+  mutate_at(c(4:5), as.numeric) %>%
+  mutate(ratio = numerator/denominator) %>%
+  select(comparison, Description, ratio) %>%
+  pivot_wider(names_from = Description, values_from = ratio) %>%
+  pivot_longer(c(2:ncol(.)), names_to = "description", values_to = "ratio") %>%
+  mutate_at(1, as.factor) 
+
+keggs$comparison <- factor(keggs$comparison, levels = c("HsS8.1 vs HsS7.1", "HsS8.1 vs WT", "HsS7.1 vs WT"))
+
+ggplot(keggs, aes(fill = comparison, y = ratio, x = description)) +
+  geom_bar(position = "dodge", stat = "identity") +
+  scale_y_continuous(limits=c(0, 0.5))+
+  xlab("") +
+  theme(panel.background = element_blank()) +
+  labs(fill = "Strain comparison") +
+  ylab("Proportion of DE proteins in pathway") + 
+  coord_flip() +
+  scale_fill_discrete(breaks=c("HsS7.1 vs WT", "HsS8.1 vs WT", "HsS8.1 vs HsS7.1")) +
+  scale_fill_viridis_d()
+
+
+```
+
+Finally, we can create a proteome-scale heatmap, simply by not filtering for any particular genes. This data clearly shows that the WT were not uniform at all, but there may be some gene clusters worth investigating in the future.
+
+```{r all sc genes heatmap}
+genelist_norm <- t(apply(sc_to_dge_fin_sys, 1, cal_z_score)) %>%
+  na.omit() %>% 
+  data.frame(sc_gene = row.names(.), .) %>%
+  dplyr::select(sc_gene, WT_a, RSHIP4N_a, RSHIP4NT_a, WT_b, RSHIP4N_b, RSHIP4NT_b, WT_c, RSHIP4N_c, RSHIP4NT_c) %>%
+  filter(!c(WT_c > 2.66 | WT_b > 2.66 | WT_a > 2.66)) %>%
+  .[, 2:10] %>%
+  as.matrix()
+
+Heatmap(genelist_norm, name = "z-score", show_row_names = FALSE, show_column_names = FALSE, show_column_dend = TRUE, cluster_rows = TRUE, cluster_columns = FALSE, column_split = factor(rep(c("WT", "HsS7.1", "HsS8.1"), 3)))
+
+```
+
+We can write the data used in this to csvs for export: the first set are the annotated gene-lists of DE proteins in each strain comparison, and the second set are the KEGG enrichment data for all three comparisons.
+
+```{r write to csvs}
+write_csv(as.data.frame(tags_7g), paste(data_path, "/7gene_logfc.csv", sep = ""))
+write_csv(as.data.frame(tags_8g), paste(data_path, "/8gene_logfc.csv", sep = ""))
+write_csv(as.data.frame(tags_7v8), paste(data_path, "/7v8_logfc.csv", sep = ""))
+
+write_csv(as.data.frame(kegg_7gene), paste(data_path, "/kegg_7gene.csv", sep = ""))
+write_csv(as.data.frame(kegg_8gene), paste(data_path, "/kegg_8gene.csv", sep = ""))
+write_csv(as.data.frame(kegg_7v8), paste(data_path, "/kegg_7v8.csv", sep = ""))
+```
+
+Citations for packages used:
+
+```{r cit}
+citation("biomaRt")
+citation("edgeR")
+citation("ComplexHeatmap")
+citation("clusterProfiler")
+```
